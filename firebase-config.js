@@ -1,9 +1,9 @@
-// Firebase configuration for the University Attendance System
+// إعدادات Firebase لمشروع "minya-special-education"
 export const firebaseConfig = {
-  apiKey: "AIzaSyBtIkLH4wpDsPJVn5yfV_yX7yiky2HfOqg",
-  authDomain: "faculty-of-specific-educ-5af73.firebaseapp.com",
-  projectId: "faculty-of-specific-educ-5af73",
-  storageBucket: "faculty-of-specific-educ-5af73.firebasestorage.app",
-  messagingSenderId: "889812105607",
-  appId: "1:889812105607:web:aad5bf85d1ee15bf697b22"
+  apiKey: "AIzaSyCQotHlqC6WSw9-uaTNTaT8wjdQYEBFuao",
+  authDomain: "minya-special-education.firebaseapp.com",
+  projectId: "minya-special-education",
+  storageBucket: "minya-special-education.firebasestorage.app",
+  messagingSenderId: "194163661401",
+  appId: "1:194163661401:web:24a51de97606086812ef48"
 };
