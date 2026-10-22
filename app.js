@@ -10,7 +10,7 @@ import {
 import { firebaseConfig } from "./firebase-config.js";
 
 /* ---------- إعدادات ---------- */
-const APP_VERSION = "2026.10.22-2";
+const APP_VERSION = "2026.10.22-3";
 const LECTURE_MINUTES = 180; // المحاضرة تُغلق تلقائيًا بعد هذه المدة
 const COLLEGE = "كلية التربية النوعية";
 const CLASS_NAME = "الفرقة الأولى – إعلام";
@@ -184,7 +184,7 @@ function authScreen(mode = "login") {
   } else if (mode === "register") {
     fields = `
       <label>الكود الجامعي<input id="fCode" inputmode="numeric" maxlength="8" placeholder="8 أرقام" autocomplete="username" required></label>
-      <p class="muted">يظهر اسمك تلقائيًا من قائمة الطلاب بعد إنشاء الحساب.</p>
+      <label>الاسم الرباعي<input id="fName" autocomplete="name" placeholder="مثال: أحمد محمد علي حسن" required></label>
       <label>كلمة المرور (6 أحرف على الأقل)<input id="fPass" type="password" minlength="6" autocomplete="new-password" required></label>
       <label>تأكيد كلمة المرور<input id="fPass2" type="password" minlength="6" autocomplete="new-password" required></label>`;
     submit = "إنشاء الحساب";
@@ -225,13 +225,13 @@ async function submitAuth(mode) {
       if (!validCode(code)) throw new Error("الكود الجامعي 8 أرقام");
       if (pass.length < 6) throw new Error("كلمة المرور 6 أحرف على الأقل");
       if (pass !== $("#fPass2").value) throw new Error("كلمتا المرور غير متطابقتين");
+      const name = $("#fName").value.trim().replace(/\s+/g, " ");
+      if (name.split(" ").length < 4) throw new Error("اكتب الاسم رباعيًا (أربع كلمات على الأقل)");
       registering = true;
       const cred = await createUserWithEmailAndPassword(auth, code + CODE_DOMAIN, pass);
       try {
-        const r = await getDoc(doc(db, "roster", code));
-        if (!r.exists()) throw new Error("هذا الكود غير موجود في قائمة الطلاب. تأكد من الكود أو تواصل مع الليدر.");
         await setDoc(doc(db, "users", cred.user.uid), {
-          uid: cred.user.uid, code, name: r.data().name, role: "student", status: "incomplete", createdAt: serverTimestamp()
+          uid: cred.user.uid, code, name, role: "student", status: "incomplete", createdAt: serverTimestamp()
         });
       } catch (e) {
         await cred.user.delete().catch(() => {});
@@ -348,8 +348,8 @@ async function enter(u) {
 function statusScreen(removed) {
   $("#tabs").innerHTML = "";
   setMain(`<div class="card center">
-    <h1>${removed ? "تم إيقاف حسابك" : "حسابك قيد المراجعة"}</h1>
-    <p class="muted">${removed ? "تواصل مع الليدر الرئيسي." : "تم استلام بياناتك. سيظهر كارنيهك بعد موافقة الليدر الرئيسي."}</p>
+    <h1>${removed ? "تم رفض حسابك" : "حسابك قيد المراجعة"}</h1>
+    <p class="muted">${removed ? "تم رفض أو إيقاف حسابك. تواصل مع الليدر الرئيسي." : "تم استلام بياناتك. سيظهر كارنيهك بعد موافقة الليدر الرئيسي على حسابك."}</p>
     <button class="primary" id="refreshBtn">تحديث الحالة</button>
   </div>`);
   $("#refreshBtn").onclick = () => enter(user).catch(e => toast(errText(e)));
@@ -358,8 +358,7 @@ function statusScreen(removed) {
 /* إكمال البيانات عند أول دخول: صورة + رقم هاتف + النوع */
 async function onboardScreen() {
   $("#tabs").innerHTML = "";
-  let rg = "";
-  try { const r = await getDoc(doc(db, "roster", profile.code)); rg = r.exists() ? r.data().gender : ""; } catch { /* ignore */ }
+  const rg = "";
   setMain(`
     <section class="card">
       <h1>أهلًا ${esc(profile.name)}</h1>
@@ -654,12 +653,17 @@ async function lectureView(id) {
   };
 }
 
-/* تحضير يدوي من قائمة الطلاب */
+// الطلاب المعتمدون (أسماؤهم كما كتبوها وقبلها الليدر الرئيسي)
+async function approvedStudents() {
+  const snap = await getDocs(query(collection(db, "users"), where("role", "==", "student")));
+  return snap.docs.map(d => d.data()).filter(u => u.status === "approved");
+}
+
+/* تحضير يدوي من الطلاب المعتمدين */
 async function manualAdd(lec, getRows) {
-  let roster;
-  try { roster = (await getDocs(collection(db, "roster"))).docs.map(d => d.data()); }
-  catch (e) { toast(errText(e)); return; }
-  if (!roster.length) { toast("قائمة الطلاب فارغة"); return; }
+  let students;
+  try { students = await approvedStudents(); } catch (e) { toast(errText(e)); return; }
+  if (!students.length) { toast("لا يوجد طلاب معتمدون بعد"); return; }
   openModal(`
     <div class="sheet" id="sheet">
       <h2>تحضير طالب يدويًا</h2>
@@ -670,18 +674,18 @@ async function manualAdd(lec, getRows) {
   $("#sheet").onclick = e => e.stopPropagation();
   $("#mClose").onclick = closeModal;
   const draw = () => {
-    const present = new Set(getRows().map(r => r.studentCode));
+    const present = new Set(getRows().map(r => r.studentId));
     const k = $("#mSearch").value.trim().toLowerCase();
-    const list = roster.filter(s => `${s.name} ${s.code}`.toLowerCase().includes(k));
-    const item = s => `<li><div><b>${esc(s.name)}</b><small>${esc(s.code)}</small></div>
-      ${present.has(s.code) ? `<span class="badge ok">حاضر</span>` : `<button class="primary small" data-add="${esc(s.code)}">تحضير</button>`}</li>`;
+    const list = students.filter(s => `${s.name} ${s.code || ""}`.toLowerCase().includes(k));
+    const item = s => `<li><div><b>${esc(s.name)}</b><small>${esc(s.code || "")}</small></div>
+      ${present.has(s.uid) ? `<span class="badge ok">حاضر</span>` : `<button class="primary small" data-add="${esc(s.uid)}">تحضير</button>`}</li>`;
     $("#mList").innerHTML = groupByGender(list).map(gr => `<li class="grp">${gr.title}</li>${gr.items.slice(0, 80).map(item).join("")}`).join("")
       || `<li class="empty">لا توجد نتائج</li>`;
     $$("[data-add]").forEach(b => b.onclick = async () => {
-      const st = roster.find(x => x.code === b.dataset.add);
+      const st = students.find(x => x.uid === b.dataset.add);
       b.disabled = true;
       try {
-        await writeAttendance(lec, st, "manual");
+        await writeAttendance(lec, { uid: st.uid, code: st.code || "", name: st.name, gender: st.gender || "" }, "manual");
         toast(`تم تحضير ${st.name}`);
         setTimeout(draw, 500);
       } catch (e) { toast(errText(e)); b.disabled = false; }
@@ -692,15 +696,15 @@ async function manualAdd(lec, getRows) {
 }
 
 // كتابة سجل الحضور + وقته (الوقت في مجموعة منفصلة يقرؤها الليدر الرئيسي والطالب صاحبها فقط)
-async function writeAttendance(lec, st, method, gender) {
-  const attId = `${lec.id}_${st.code}`;
+async function writeAttendance(lec, st, method) {
+  const attId = `${lec.id}_${st.uid}`;
   const bt = writeBatch(db);
   bt.set(doc(db, "attendance", attId), {
     lectureId: lec.id, courseId: lec.courseId || "", courseName: lec.courseName || "", doctorId: lec.doctorId || "",
-    studentCode: st.code, studentName: st.name, gender: gender ?? st.gender ?? "",
+    studentId: st.uid, studentCode: st.code || "", studentName: st.name, gender: st.gender || "",
     lectureTitle: String(lec.title).slice(0, 60), status: "present", method, by: user.uid
   });
-  bt.set(doc(db, "attendanceTimes", attId), { lectureId: lec.id, studentCode: st.code, createdAt: serverTimestamp() });
+  bt.set(doc(db, "attendanceTimes", attId), { lectureId: lec.id, studentId: st.uid, createdAt: serverTimestamp() });
   await bt.commit();
   return attId;
 }
@@ -806,68 +810,50 @@ async function handleCode(code, method, lec) {
 }
 
 async function registerByCode(code, method, lec) {
-  const rs = await getDoc(doc(db, "roster", code));
-  if (!rs.exists()) { const e = new Error("هذا الكود غير موجود في قائمة الطلاب"); e.info = { code }; throw e; }
-  const st = rs.data();
-  let acct = null, photo = "";
+  const us = await getDocs(query(collection(db, "users"), where("code", "==", code)));
+  const acct = us.docs[0]?.data();
+  if (!acct) { const e = new Error("هذا الكود غير مسجّل في الموقع. يجب أن ينشئ الطالب حسابه أولًا."); e.info = { code }; throw e; }
+  let photo = "";
+  try { const ph = await getDoc(doc(db, "photos", acct.uid)); if (ph.exists()) photo = ph.data().data; } catch { /* الصورة اختيارية */ }
+  const info = { name: acct.name, code, photo };
+  if (acct.status === "removed") { const e = new Error("حساب هذا الطالب مرفوض أو موقوف"); e.info = info; throw e; }
+  if (acct.status !== "approved") { const e = new Error("حساب الطالب لم يُعتمد بعد من الليدر الرئيسي"); e.info = info; throw e; }
   try {
-    const us = await getDocs(query(collection(db, "users"), where("code", "==", code)));
-    acct = us.docs[0]?.data() || null;
-    if (acct) { const ph = await getDoc(doc(db, "photos", acct.uid)).catch(() => null); photo = ph?.exists() ? ph.data().data : ""; }
-  } catch { /* الصورة اختيارية */ }
-  const info = { name: st.name, code, photo };
-  if (acct && acct.status === "removed") { const e = new Error("حساب هذا الطالب موقوف"); e.info = info; throw e; }
-  try {
-    await writeAttendance(lec, st, method, acct?.gender || st.gender || "");
+    await writeAttendance(lec, { uid: acct.uid, code, name: acct.name, gender: acct.gender || "" }, method);
   } catch (e) {
     if (e.code === "permission-denied") {
       let already = false;
-      try { already = (await getDoc(doc(db, "attendance", `${lec.id}_${code}`))).exists(); } catch { /* ignore */ }
+      try { already = (await getDoc(doc(db, "attendance", `${lec.id}_${acct.uid}`))).exists(); } catch { /* ignore */ }
       const err = new Error(already ? "تم تسجيل حضوره من قبل" : "تعذر التسجيل: تأكد أن المحاضرة ما زالت جارية");
       err.info = info;
       throw err;
     }
     throw e;
   }
-  return { ...info, msg: acct ? "" : "(لم ينشئ حسابه بعد)" };
+  return { ...info, msg: "" };
 }
 
 /* =====================================================
    الطلاب (قائمة الطلاب + الموافقات + الليدرز)
    ===================================================== */
 async function studentsTab() {
-  const [rs, us, lds] = await Promise.all([
-    getDocs(collection(db, "roster")),
+  const [us, lds] = await Promise.all([
     getDocs(query(collection(db, "users"), where("role", "==", "student"))),
     getDocs(collection(db, "leaders"))
   ]);
   const leaderIds = new Set(lds.docs.map(d => d.id));
   const users = us.docs.map(d => d.data());
-  const byCode = {};
-  users.forEach(u => { if (u.code) byCode[u.code] = u; });
   const priv = {}; // الأرقام الكاملة: الليدر الرئيسي فقط
   if (isMainLeader) { try { (await getDocs(collection(db, "userPrivate"))).forEach(d => { priv[d.id] = d.data().phone; }); } catch { /* ignore */ } }
   const phoneOf = u => (u ? (isMainLeader ? (priv[u.uid] || "") : (u.phoneMasked || "")) : "");
   const phoneHtml = u => `<span dir="ltr">${esc(phoneOf(u))}</span>`;
 
-  const rows = rs.docs.map(d => d.data()).map(r => {
-    const u = byCode[r.code] || null;
-    return { key: r.code, code: r.code, name: u?.name || r.name, gender: u?.gender || r.gender || "", user: u };
-  });
-  users.filter(u => !u.code).forEach(u => rows.push({ key: u.uid, code: "", name: u.name, gender: u.gender || "", user: u }));
-  const statusOf = r => (!r.user ? "none" : leaderIds.has(r.user.uid) ? "approved" : (r.user.status || "pending"));
-  const stLabel = { none: "لم يسجّل", incomplete: "لم يُكمل بياناته", pending: "قيد المراجعة", approved: "مسجّل", removed: "موقوف" };
+  const rows = users.map(u => ({ key: u.uid, code: u.code || "", name: u.name, gender: u.gender || "", user: u }));
+  const statusOf = r => (leaderIds.has(r.user.uid) ? "approved" : (r.user.status || "pending"));
+  const stLabel = { incomplete: "لم يُكمل بياناته", pending: "قيد المراجعة", approved: "معتمد", removed: "مرفوض/موقوف" };
 
   setMain(`
     <h1>الطلاب <small class="muted">(${num(rows.length)})</small></h1>
-    <details class="card"><summary>إضافة طالب جديد (كود واسم)</summary>
-      <form id="addForm">
-        <label>الكود الجامعي<input id="aCode" inputmode="numeric" maxlength="8" placeholder="8 أرقام" required></label>
-        <label>الاسم الرباعي<input id="aName" required></label>
-        <label>النوع<select id="aGender"><option value="male">ذكر</option><option value="female">أنثى</option></select></label>
-        <button class="primary full" id="aBtn">إضافة</button>
-      </form>
-    </details>
     <div id="pendingBox"></div>
     <div id="editBox"></div>
     <input id="search" class="search" type="search" placeholder="ابحث بالاسم أو الكود أو الهاتف">
@@ -876,19 +862,6 @@ async function studentsTab() {
       <tbody id="rows"></tbody>
     </table></div>
     <div id="removedBox"></div>`);
-
-  $("#addForm").onsubmit = async e => {
-    e.preventDefault();
-    const code = normPhone($("#aCode").value), name = $("#aName").value.trim().replace(/\s+/g, " ");
-    if (!validCode(code)) { toast("الكود الجامعي 8 أرقام"); return; }
-    if (name.length < 3) { toast("اكتب الاسم"); return; }
-    $("#aBtn").disabled = true;
-    try {
-      await setDoc(doc(db, "roster", code), { code, name, gender: $("#aGender").value, year: "", addedBy: user.uid, createdAt: serverTimestamp() });
-      toast("تمت إضافة الطالب");
-      studentsTab();
-    } catch (err) { toast(err.code === "permission-denied" ? "هذا الكود مضاف بالفعل" : errText(err)); $("#aBtn").disabled = false; }
-  };
 
   // طلبات تعديل الحسابات (الليدر الرئيسي فقط)
   let reqs = [];
@@ -1035,17 +1008,10 @@ async function createSecondaryUser(email, pass) {
 
 async function adminTab() {
   if (!isMainLeader) { setMain(`<div class="card muted">هذه الصفحة للليدر الرئيسي فقط.</div>`); return; }
-  const [rs, ds, cs] = await Promise.all([getDocs(collection(db, "roster")), getDocs(collection(db, "doctors")), getDocs(collection(db, "courses"))]);
+  const [ds, cs] = await Promise.all([getDocs(collection(db, "doctors")), getDocs(collection(db, "courses"))]);
   const doctors = ds.docs.map(d => d.data()).sort(byName);
   const courses = cs.docs.map(d => ({ id: d.id, ...d.data() })).sort(byName);
   setMain(`
-    <section class="card">
-      <h2>قائمة الطلاب (${num(rs.size)} طالب)</h2>
-      <p class="muted">استورد ملف <b>roster.json</b> (قائمة الفرقة الأولى) مرة واحدة. الأكواد الموجودة تُحدَّث ولا تتكرر.</p>
-      <input id="rosterFile" type="file" accept="application/json,.json">
-      <button class="primary full" id="rosterGo">استيراد القائمة</button>
-      <div id="rosterMsg" class="msg" role="status"></div>
-    </section>
     <section class="card">
       <h2>الدكاترة (${num(doctors.length)})</h2>
       <div class="list">${doctors.map(d => `<div class="item static"><div><b>${esc(d.name)}</b></div><button class="ghost small" data-deldoc="${esc(d.uid)}">إلغاء الصلاحية</button></div>`).join("") || `<p class="muted">لا يوجد دكاترة بعد.</p>`}</div>
@@ -1067,31 +1033,6 @@ async function adminTab() {
         <button class="primary full" id="cBtn" ${doctors.length ? "" : "disabled"}>إضافة المادة</button>
       </form>
     </section>`);
-
-  $("#rosterGo").onclick = async () => {
-    const f = $("#rosterFile").files?.[0], msg = $("#rosterMsg");
-    if (!f) { msg.textContent = "اختر ملف roster.json أولًا"; return; }
-    $("#rosterGo").disabled = true;
-    try {
-      const list = JSON.parse(await f.text());
-      if (!Array.isArray(list)) throw new Error("صيغة الملف غير صحيحة");
-      const ok = list.filter(r => validCode(String(r.code)) && String(r.name || "").trim().length >= 3 && ["male", "female", ""].includes(r.gender || ""));
-      if (!ok.length) throw new Error("لا توجد أسماء صالحة في الملف");
-      let done = 0;
-      for (let i = 0; i < ok.length; i += 400) {
-        const bt = writeBatch(db);
-        ok.slice(i, i + 400).forEach(r => bt.set(doc(db, "roster", String(r.code)), {
-          code: String(r.code), name: String(r.name).trim().replace(/\s+/g, " "), gender: r.gender || "", year: String(r.year || "").slice(0, 20),
-          addedBy: user.uid, createdAt: serverTimestamp()
-        }));
-        await bt.commit();
-        done += Math.min(400, ok.length - i);
-        msg.textContent = `تم استيراد ${num(done)} من ${num(ok.length)}...`;
-      }
-      msg.textContent = `تم استيراد ${num(done)} طالب بنجاح ✓`;
-      setTimeout(adminTab, 1200);
-    } catch (e) { msg.textContent = errText(e); $("#rosterGo").disabled = false; }
-  };
 
   $("#docForm").onsubmit = async e => {
     e.preventDefault();
@@ -1143,12 +1084,15 @@ const GROUP_TITLE = { male: "الطلاب (ذكور)", female: "الطالبات
 
 // كشف محاضرة واحدة: كل الطلاب (حضور/غياب) أو الحاضرون فقط أو الغائبون فقط
 async function lectureDataset(lec, type) {
-  const [rs, as] = await Promise.all([
-    getDocs(collection(db, "roster")),
+  const [studs, as] = await Promise.all([
+    approvedStudents(),
     getDocs(query(collection(db, "attendance"), where("lectureId", "==", lec.id)))
   ]);
-  const present = new Set(as.docs.map(d => d.data().studentCode));
-  const people = rs.docs.map(d => d.data()).map(r => ({ ...r, present: present.has(r.code) }));
+  const present = new Set(as.docs.map(d => d.data().studentId));
+  const byId = {};
+  studs.forEach(u => { byId[u.uid] = { uid: u.uid, code: u.code || "", name: u.name, gender: u.gender || "" }; });
+  as.docs.forEach(d => { const a = d.data(); if (!byId[a.studentId]) byId[a.studentId] = { uid: a.studentId, code: a.studentCode || "", name: a.studentName, gender: a.gender || "" }; });
+  const people = Object.values(byId).map(p => ({ ...p, present: present.has(p.uid) }));
   const list = people.filter(p => type === "all" || (type === "present" ? p.present : !p.present));
   const kind = { all: "كشف حضور وغياب", present: "كشف الحاضرين", absent: "كشف الغائبين" }[type];
   const presentCount = people.filter(p => p.present).length;
@@ -1172,8 +1116,8 @@ async function lectureDataset(lec, type) {
 
 // الكشف الكامل: كل الطلاب × كل المحاضرات (لدكتور معيّن أو للجميع)
 async function matrixDataset(doctorId, doctorName, courseId, courseName) {
-  const [rs, ls, as] = await Promise.all([
-    getDocs(collection(db, "roster")), getDocs(collection(db, "lectures")), getDocs(collection(db, "attendance"))
+  const [studs, ls, as] = await Promise.all([
+    approvedStudents(), getDocs(collection(db, "lectures")), getDocs(collection(db, "attendance"))
   ]);
   const lectures = ls.docs.map(d => ({ id: d.id, ...d.data() }))
     .filter(l => (!doctorId || l.doctorId === doctorId) && (!courseId || l.courseId === courseId))
@@ -1181,8 +1125,15 @@ async function matrixDataset(doctorId, doctorName, courseId, courseName) {
   if (!lectures.length) throw new Error("لا توجد محاضرات لهذا الاختيار");
   const ids = new Set(lectures.map(l => l.id));
   const present = new Set();
-  as.docs.forEach(d => { const a = d.data(); if (ids.has(a.lectureId) && a.studentCode) present.add(`${a.lectureId}|${a.studentCode}`); });
-  const people = rs.docs.map(d => d.data());
+  const byId = {};
+  studs.forEach(u => { byId[u.uid] = { uid: u.uid, code: u.code || "", name: u.name, gender: u.gender || "" }; });
+  as.docs.forEach(d => {
+    const a = d.data();
+    if (!ids.has(a.lectureId) || !a.studentId) return;
+    present.add(`${a.lectureId}|${a.studentId}`);
+    if (!byId[a.studentId]) byId[a.studentId] = { uid: a.studentId, code: a.studentCode || "", name: a.studentName, gender: a.gender || "" };
+  });
+  const people = Object.values(byId);
   const males = people.filter(p => p.gender === "male").length, females = people.filter(p => p.gender === "female").length;
   return {
     title: "كشف الحضور الكلي",
@@ -1196,7 +1147,7 @@ async function matrixDataset(doctorId, doctorName, courseId, courseName) {
     groups: groupByGender(people).map(gr => ({
       title: GROUP_TITLE[gr.key],
       rows: gr.items.map((p, i) => {
-        const cells = lectures.map(l => present.has(`${l.id}|${p.code}`));
+        const cells = lectures.map(l => present.has(`${l.id}|${p.uid}`));
         return [num(i + 1), p.name, p.code, ...cells.map(c => (c ? "✓" : "")), `${num(cells.filter(Boolean).length)} / ${num(lectures.length)}`];
       })
     })),
@@ -1362,10 +1313,9 @@ async function cardTab() {
 }
 
 async function mineTab() {
-  if (!profile.code) { setMain(`<div class="card muted">لا توجد سجلات.</div>`); return; }
-  const snap = await getDocs(query(collection(db, "attendance"), where("studentCode", "==", profile.code)));
+  const snap = await getDocs(query(collection(db, "attendance"), where("studentId", "==", user.uid)));
   const times = {};
-  try { (await getDocs(query(collection(db, "attendanceTimes"), where("studentCode", "==", profile.code)))).forEach(d => { times[d.id] = toDate(d.data().createdAt); }); } catch { /* اختياري */ }
+  try { (await getDocs(query(collection(db, "attendanceTimes"), where("studentId", "==", user.uid)))).forEach(d => { times[d.id] = toDate(d.data().createdAt); }); } catch { /* اختياري */ }
   const rows = snap.docs.map(d => ({ ...d.data(), at: times[d.id] || null })).sort((a, b) => (b.at?.getTime() || 0) - (a.at?.getTime() || 0));
   setMain(`
     <section class="card count-card"><strong>${num(rows.length)}</strong><span>محاضرة حضرتها</span></section>
