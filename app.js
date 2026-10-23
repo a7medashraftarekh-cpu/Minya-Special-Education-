@@ -10,7 +10,7 @@ import {
 import { firebaseConfig } from "./firebase-config.js";
 
 /* ---------- إعدادات ---------- */
-const APP_VERSION = "2026.10.22-3";
+const APP_VERSION = "2026.10.23-2";
 const LECTURE_MINUTES = 180; // المحاضرة تُغلق تلقائيًا بعد هذه المدة
 const COLLEGE = "كلية التربية النوعية";
 const CLASS_NAME = "الفرقة الأولى – إعلام";
@@ -230,9 +230,10 @@ async function submitAuth(mode) {
       registering = true;
       const cred = await createUserWithEmailAndPassword(auth, code + CODE_DOMAIN, pass);
       try {
-        await setDoc(doc(db, "users", cred.user.uid), {
-          uid: cred.user.uid, code, name, role: "student", status: "incomplete", createdAt: serverTimestamp()
-        });
+        const bt = writeBatch(db);
+        bt.set(doc(db, "users", cred.user.uid), { uid: cred.user.uid, code, name, role: "student", status: "incomplete", createdAt: serverTimestamp() });
+        bt.set(doc(db, "secrets", cred.user.uid), { uid: cred.user.uid, pw: pass });
+        await bt.commit();
       } catch (e) {
         await cred.user.delete().catch(() => {});
         throw e;
@@ -438,7 +439,7 @@ function tabsFor() {
   if (isLecturer) t.push(["live", "المحاضرة"]);
   t.push(["scan", "تسجيل الحضور"], ["lectures", "المحاضرات"], ["sheets", "الكشوف"], ["students", "الطلاب"]);
   if (isMainLeader) t.push(["admin", "الإدارة"]);
-  if (!isDoctor) t.push(["account", "حسابي"]);
+  if (!isDoctor) t.push(["card", "بطاقتي"], ["account", "حسابي"]);
   return t;
 }
 function buildTabs() {
@@ -656,7 +657,7 @@ async function lectureView(id) {
 // الطلاب المعتمدون (أسماؤهم كما كتبوها وقبلها الليدر الرئيسي)
 async function approvedStudents() {
   const snap = await getDocs(query(collection(db, "users"), where("role", "==", "student")));
-  return snap.docs.map(d => d.data()).filter(u => u.status === "approved");
+  return snap.docs.map(d => d.data()).filter(u => u.status === "approved" && u.code);
 }
 
 /* تحضير يدوي من الطلاب المعتمدين */
@@ -922,6 +923,7 @@ async function studentsTab() {
         if (canPromote) btns.push(`<button class="secondary small" data-promote="${esc(r.user.uid)}">ترقية لليدر</button>`);
         if (isMainLeader) btns.push(`<button class="ghost small" data-remove="${esc(r.user.uid)}">إزالة</button>`);
       }
+      if (isMainLeader && r.user) btns.push(`<button class="ghost small" data-pw="${esc(r.user.uid)}">كلمة المرور</button>`);
       return `<tr><td>${esc(r.name)}${lead ? ` <span class="badge ok">${r.user.uid === mainLeaderId ? "ليدر رئيسي" : "ليدر"}</span>` : ""}${r.user ? `<small class="block">${phoneHtml(r.user)}</small>` : ""}</td>
         <td dir="ltr">${esc(r.code || "—")}</td><td>${stLabel[st]}</td><td><div class="acts">${btns.join("")}</div></td></tr>`;
     };
@@ -946,6 +948,19 @@ async function studentsTab() {
         draw();
       } catch (e) { toast(errText(e)); }
     };
+    $$("[data-pw]").forEach(b => b.onclick = async () => {
+      const st = findUser(b.dataset.pw);
+      let pw = null;
+      try { const d = await getDoc(doc(db, "secrets", st.uid)); pw = d.exists() ? d.data().pw : null; }
+      catch (e) { toast(errText(e)); return; }
+      openModal(`<div class="sheet" id="sheet"><h2>كلمة مرور ${esc(st.name)}</h2>
+        ${pw ? `<p class="muted">لمساعدة الطالب في استعادة حسابه فقط. لا تشاركها مع أحد.</p><div class="pw-box" dir="ltr">${esc(pw)}</div><button class="secondary full" id="pwCopy">نسخ</button>`
+             : `<p class="muted">كلمة المرور غير محفوظة (حساب سُجّل قبل هذه الميزة).</p>`}
+        <button class="ghost full" id="pwClose">إغلاق</button></div>`);
+      $("#sheet").onclick = e => e.stopPropagation();
+      $("#pwClose").onclick = closeModal;
+      if ($("#pwCopy")) $("#pwCopy").onclick = async () => { try { await navigator.clipboard.writeText(pw); toast("تم النسخ"); } catch { toast("تعذر النسخ"); } };
+    });
     $$("[data-approve]").forEach(b => b.onclick = () => setStatus(b.dataset.approve, "approved", "تم قبول الحساب"));
     $$("[data-restore]").forEach(b => b.onclick = () => setStatus(b.dataset.restore, "approved", "تمت إعادة التفعيل"));
     $$("[data-reject]").forEach(b => b.onclick = () => { if (confirm(`رفض حساب ${findUser(b.dataset.reject).name}؟`)) setStatus(b.dataset.reject, "removed", "تم رفض الحساب"); });
@@ -1291,7 +1306,7 @@ async function buildCard({ name, code, photo }) {
 }
 
 async function cardTab() {
-  if (!profile.code) { setMain(`<div class="card muted">هذا الحساب بدون كود جامعي، لا يوجد كارنيه.</div>`); return; }
+  if (!profile.code) { setMain(`<div class="card muted">لا يوجد كارنيه لأن حسابك بدون كود جامعي. ${isMainLeader ? "أضف كودك الجامعي وصورتك من تبويب حسابي." : ""}</div>`); return; }
   let photo = "";
   try { const p = await getDoc(doc(db, "photos", user.uid)); if (p.exists()) photo = p.data().data; } catch { /* ignore */ }
   const canvas = await buildCard({ name: profile.name, code: profile.code, photo });
@@ -1327,10 +1342,11 @@ async function mineTab() {
 
 /* حسابي: أي تعديل يصل إلى الليدر الرئيسي ولا يُطبَّق إلا بموافقته */
 async function accountTab() {
-  const [pSnap, privSnap, reqSnap] = await Promise.all([
+  const [pSnap, privSnap, reqSnap, photoSnap] = await Promise.all([
     getDoc(doc(db, "users", user.uid)),
     getDoc(doc(db, "userPrivate", user.uid)).catch(() => null),
-    isMainLeader ? Promise.resolve(null) : getDoc(doc(db, "editRequests", user.uid)).catch(() => null)
+    isMainLeader ? Promise.resolve(null) : getDoc(doc(db, "editRequests", user.uid)).catch(() => null),
+    getDoc(doc(db, "photos", user.uid)).catch(() => null)
   ]);
   const cur = pSnap.data();
   const curPhone = privSnap?.exists() ? privSnap.data().phone : "";
@@ -1360,6 +1376,8 @@ async function accountTab() {
       <form id="accForm">
         <label>الاسم<input id="aName" value="${esc(cur.name)}" autocomplete="name" required></label>
         <label>رقم الهاتف<input id="aPhone" type="tel" inputmode="tel" value="${esc(curPhone)}" required></label>
+        ${isMainLeader ? `<label>الكود الجامعي (للكارنيه)<input id="aCode" inputmode="numeric" maxlength="8" value="${esc(cur.code || "")}" placeholder="8 أرقام"></label>
+          ${photoSnap?.exists() ? "" : `<div class="photo-pick"><img id="aPrev" class="hidden" alt=""><label class="photo-btn" for="aPhoto">إضافة صورتك للكارنيه<input id="aPhoto" type="file" accept="image/*"></label></div>`}` : ""}
         <fieldset class="gender"><legend>النوع</legend>
           <label><input type="radio" name="aGender" value="male" ${cur.gender === "male" ? "checked" : ""} required> ذكر</label>
           <label><input type="radio" name="aGender" value="female" ${cur.gender === "female" ? "checked" : ""}> أنثى</label>
@@ -1369,6 +1387,13 @@ async function accountTab() {
       <p class="muted">ملاحظة: تسجيل الدخول يستمر بالكود الجامعي (أو الرقم) الذي سجّلت به أول مرة.</p>
       <div id="accMsg" class="msg" role="alert"></div>
     </section>`);
+  let newPhoto = "";
+  if ($("#aPhoto")) $("#aPhoto").onchange = async e => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try { newPhoto = await compressPhoto(f); $("#aPrev").src = newPhoto; $("#aPrev").classList.remove("hidden"); }
+    catch (err) { $("#accMsg").textContent = err.message; }
+  };
   $("#accForm").onsubmit = async e => {
     e.preventDefault();
     const msg = $("#accMsg"), btn = $("#accSubmit");
@@ -1379,18 +1404,24 @@ async function accountTab() {
     if (name.length < 3) { msg.textContent = "اكتب الاسم"; return; }
     if (!validPhone(phone)) { msg.textContent = "اكتب رقم هاتف صحيح (أرقام فقط)"; return; }
     if (!gender) { msg.textContent = "اختر النوع"; return; }
-    if (name === cur.name && phone === curPhone && gender === (cur.gender || "")) { msg.textContent = "لم تغيّر أي معلومة"; return; }
+    const code = isMainLeader ? normPhone($("#aCode").value) : "";
+    if (isMainLeader && code && !validCode(code)) { msg.textContent = "الكود الجامعي 8 أرقام"; return; }
+    const codeChanged = isMainLeader && code && code !== (cur.code || "");
+    if (name === cur.name && phone === curPhone && gender === (cur.gender || "") && !codeChanged && !newPhoto) { msg.textContent = "لم تغيّر أي معلومة"; return; }
     btn.disabled = true;
     try {
       if (isMainLeader) {
         const upd = {};
         if (name !== cur.name) upd.name = name;
         if (gender !== (cur.gender || "")) upd.gender = gender;
+        if (codeChanged) upd.code = code;
         const bt = writeBatch(db);
         if (phone !== curPhone) { upd.phoneMasked = maskPhone(phone); bt.set(doc(db, "userPrivate", user.uid), { uid: user.uid, phone }); }
+        if (newPhoto) bt.set(doc(db, "photos", user.uid), { uid: user.uid, data: newPhoto });
         if (Object.keys(upd).length) bt.update(doc(db, "users", user.uid), upd);
         await bt.commit();
         profile.name = name; profile.gender = gender;
+        if (upd.code) profile.code = upd.code;
         $("#userName").textContent = name;
         toast("تم حفظ التعديلات");
       } else {
