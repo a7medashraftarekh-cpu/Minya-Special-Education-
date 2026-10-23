@@ -10,7 +10,7 @@ import {
 import { firebaseConfig } from "./firebase-config.js";
 
 /* ---------- إعدادات ---------- */
-const APP_VERSION = "2026.10.23-2";
+const APP_VERSION = "2026.10.23-3";
 const LECTURE_MINUTES = 180; // المحاضرة تُغلق تلقائيًا بعد هذه المدة
 const COLLEGE = "كلية التربية النوعية";
 const CLASS_NAME = "الفرقة الأولى – إعلام";
@@ -948,19 +948,7 @@ async function studentsTab() {
         draw();
       } catch (e) { toast(errText(e)); }
     };
-    $$("[data-pw]").forEach(b => b.onclick = async () => {
-      const st = findUser(b.dataset.pw);
-      let pw = null;
-      try { const d = await getDoc(doc(db, "secrets", st.uid)); pw = d.exists() ? d.data().pw : null; }
-      catch (e) { toast(errText(e)); return; }
-      openModal(`<div class="sheet" id="sheet"><h2>كلمة مرور ${esc(st.name)}</h2>
-        ${pw ? `<p class="muted">لمساعدة الطالب في استعادة حسابه فقط. لا تشاركها مع أحد.</p><div class="pw-box" dir="ltr">${esc(pw)}</div><button class="secondary full" id="pwCopy">نسخ</button>`
-             : `<p class="muted">كلمة المرور غير محفوظة (حساب سُجّل قبل هذه الميزة).</p>`}
-        <button class="ghost full" id="pwClose">إغلاق</button></div>`);
-      $("#sheet").onclick = e => e.stopPropagation();
-      $("#pwClose").onclick = closeModal;
-      if ($("#pwCopy")) $("#pwCopy").onclick = async () => { try { await navigator.clipboard.writeText(pw); toast("تم النسخ"); } catch { toast("تعذر النسخ"); } };
-    });
+    $$("[data-pw]").forEach(b => b.onclick = () => showPassword(b.dataset.pw, findUser(b.dataset.pw).name));
     $$("[data-approve]").forEach(b => b.onclick = () => setStatus(b.dataset.approve, "approved", "تم قبول الحساب"));
     $$("[data-restore]").forEach(b => b.onclick = () => setStatus(b.dataset.restore, "approved", "تمت إعادة التفعيل"));
     $$("[data-reject]").forEach(b => b.onclick = () => { if (confirm(`رفض حساب ${findUser(b.dataset.reject).name}؟`)) setStatus(b.dataset.reject, "removed", "تم رفض الحساب"); });
@@ -1011,6 +999,21 @@ async function studentsTab() {
   draw();
 }
 
+
+/* عرض كلمة مرور حساب (الليدر الرئيسي فقط) */
+async function showPassword(uid, name) {
+  let pw = null;
+  try { const d = await getDoc(doc(db, "secrets", uid)); pw = d.exists() ? d.data().pw : null; }
+  catch (e) { toast(errText(e)); return; }
+  openModal(`<div class="sheet" id="sheet"><h2>كلمة مرور ${esc(name)}</h2>
+    ${pw ? `<p class="muted">لمساعدة صاحب الحساب في استعادته فقط. لا تشاركها مع أحد.</p><div class="pw-box" dir="ltr">${esc(pw)}</div><button class="secondary full" id="pwCopy">نسخ</button>`
+         : `<p class="muted">كلمة المرور غير محفوظة (حساب سُجّل قبل هذه الميزة).</p>`}
+    <button class="ghost full" id="pwClose">إغلاق</button></div>`);
+  $("#sheet").onclick = e => e.stopPropagation();
+  $("#pwClose").onclick = closeModal;
+  if ($("#pwCopy")) $("#pwCopy").onclick = async () => { try { await navigator.clipboard.writeText(pw); toast("تم النسخ"); } catch { toast("تعذر النسخ"); } };
+}
+
 /* =====================================================
    الإدارة (الليدر الرئيسي): قائمة الطلاب + الدكاترة + المواد
    ===================================================== */
@@ -1029,7 +1032,7 @@ async function adminTab() {
   setMain(`
     <section class="card">
       <h2>الدكاترة (${num(doctors.length)})</h2>
-      <div class="list">${doctors.map(d => `<div class="item static"><div><b>${esc(d.name)}</b></div><button class="ghost small" data-deldoc="${esc(d.uid)}">إلغاء الصلاحية</button></div>`).join("") || `<p class="muted">لا يوجد دكاترة بعد.</p>`}</div>
+      <div class="list">${doctors.map(d => `<div class="item static"><div><b>${esc(d.name)}</b></div><div class="acts"><button class="ghost small" data-docpw="${esc(d.uid)}">كلمة المرور</button><button class="ghost small" data-deldoc="${esc(d.uid)}">إلغاء الصلاحية</button></div></div>`).join("") || `<p class="muted">لا يوجد دكاترة بعد.</p>`}</div>
       <form id="docForm">
         <h3>إضافة دكتور</h3>
         <label>الاسم<input id="dName" required></label>
@@ -1064,6 +1067,7 @@ async function adminTab() {
         bt.set(doc(db, "users", uid), { uid, name, phoneMasked: maskPhone(phone), role: "doctor", status: "approved", createdAt: serverTimestamp() });
         bt.set(doc(db, "userPrivate", uid), { uid, phone });
         bt.set(doc(db, "doctors", uid), { uid, name, createdBy: user.uid, createdAt: serverTimestamp() });
+        bt.set(doc(db, "secrets", uid), { uid, pw: pass });
         await bt.commit();
       } catch (err) { await sec.cred.user.delete().catch(() => {}); throw err; }
       toast("تم إنشاء حساب الدكتور");
@@ -1086,6 +1090,7 @@ async function adminTab() {
     if (!confirm("حذف المادة؟ (المحاضرات السابقة تبقى كما هي)")) return;
     try { await deleteDoc(doc(db, "courses", b.dataset.delcourse)); adminTab(); } catch (e) { toast(errText(e)); }
   });
+  $$("[data-docpw]").forEach(b => b.onclick = () => showPassword(b.dataset.docpw, (doctors.find(d => d.uid === b.dataset.docpw) || {}).name || ""));
   $$("[data-deldoc]").forEach(b => b.onclick = async () => {
     if (!confirm("إلغاء صلاحيات هذا الدكتور؟ لن يستطيع الدخول كدكتور.")) return;
     try { await deleteDoc(doc(db, "doctors", b.dataset.deldoc)); adminTab(); } catch (e) { toast(errText(e)); }
