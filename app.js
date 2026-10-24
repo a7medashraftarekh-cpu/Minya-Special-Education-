@@ -10,7 +10,7 @@ import {
 import { firebaseConfig } from "./firebase-config.js";
 
 /* ---------- إعدادات ---------- */
-const APP_VERSION = "2026.10.23-3";
+const APP_VERSION = "2026.10.23-4";
 const LECTURE_MINUTES = 180; // المحاضرة تُغلق تلقائيًا بعد هذه المدة
 const COLLEGE = "كلية التربية النوعية";
 const CLASS_NAME = "الفرقة الأولى – إعلام";
@@ -126,11 +126,22 @@ function loadScript(src, ready) {
   });
 }
 
+// الليدر فعّال ما لم تنته مدته أو يستهلك عدد الطلاب المسموح له (بعدها يعود طالبًا عاديًا)
+function leaderActive(info) {
+  if (!info) return false;
+  const exp = toDate(info.expiresAt);
+  if (exp && exp.getTime() <= Date.now()) return false;
+  if (info.maxScans && (info.used || 0) >= info.maxScans) return false;
+  return true;
+}
+
 /* ---------- الحالة ---------- */
 let user = null;
 let profile = null;
 let isDoctor = false;
 let isLeader = false;
+let isGirlsLeader = false; // ليدر البنات (واحدة فقط)
+let leaderInfo = null;     // بيانات ترقية الليدر: العدد والمدة
 let isStaff = false;      // دكتور أو ليدر (أي ليدر بما فيهم الرئيسي)
 let isMainLeader = false; // أول ليدر يدخل: أعلى صلاحية
 let isLecturer = false;   // الدكتور والليدر الرئيسي: يبدؤون المحاضرات وينهونها ويحذفونها
@@ -279,7 +290,7 @@ onAuthStateChanged(auth, async u => {
   clearLive();
   await stopScanner();
   if (!u) {
-    user = null; profile = null; isDoctor = isLeader = isStaff = isMainLeader = isLecturer = false; mainLeaderId = null;
+    user = null; profile = null; isDoctor = isLeader = isStaff = isMainLeader = isLecturer = isGirlsLeader = false; mainLeaderId = null; leaderInfo = null;
     try { doctorExists = (await getDoc(doc(db, "settings", "doctor"))).exists(); } catch { doctorExists = null; }
     authScreen(location.hash === "#setup" ? "setup" : "login");
     showAuth();
@@ -309,7 +320,9 @@ async function enter(u) {
   profile = p.data();
   doctorExists = d.exists();
   isDoctor = dl.exists() || (d.exists() && d.data().uid === u.uid);
-  isLeader = !isDoctor && l.exists();
+  leaderInfo = l.exists() ? l.data() : null;
+  isLeader = !isDoctor && !!leaderInfo && leaderActive(leaderInfo);
+  isGirlsLeader = isLeader && leaderInfo.kind === "girls";
   isStaff = isDoctor || isLeader;
   if (profile.role === "doctor" && !isDoctor) {
     authNotice = "تم إلغاء صلاحيات هذا الحساب. تواصل مع الليدر الرئيسي.";
@@ -334,7 +347,7 @@ async function enter(u) {
   isLecturer = isDoctor || isMainLeader;
 
   $("#userName").textContent = profile.name;
-  $("#userRole").textContent = isDoctor ? "دكتور" : isMainLeader ? "ليدر رئيسي" : isLeader ? "ليدر" : "طالب";
+  $("#userRole").textContent = isDoctor ? "دكتور" : isMainLeader ? "ليدر رئيسي" : isGirlsLeader ? "ليدر البنات" : isLeader ? "ليدر" : "طالب";
   showApp();
 
   if (!isStaff) {
@@ -699,6 +712,8 @@ async function manualAdd(lec, getRows) {
 // كتابة سجل الحضور + وقته (الوقت في مجموعة منفصلة يقرؤها الليدر الرئيسي والطالب صاحبها فقط)
 async function writeAttendance(lec, st, method) {
   const attId = `${lec.id}_${st.uid}`;
+  const counted = isLeader && !isMainLeader && !isDoctor && method !== "manual"; // الليدر المحدود: كل تسجيل يُحسب من عدده
+  const n = counted ? ((leaderInfo && leaderInfo.used) || 0) + 1 : 0;
   const bt = writeBatch(db);
   bt.set(doc(db, "attendance", attId), {
     lectureId: lec.id, courseId: lec.courseId || "", courseName: lec.courseName || "", doctorId: lec.doctorId || "",
@@ -706,7 +721,12 @@ async function writeAttendance(lec, st, method) {
     lectureTitle: String(lec.title).slice(0, 60), status: "present", method, by: user.uid
   });
   bt.set(doc(db, "attendanceTimes", attId), { lectureId: lec.id, studentId: st.uid, createdAt: serverTimestamp() });
+  if (counted) {
+    bt.set(doc(db, "leaderScans", `${user.uid}_${n}`), { uid: user.uid, n, attId, createdAt: serverTimestamp() });
+    bt.update(doc(db, "leaders", user.uid), { used: n });
+  }
   await bt.commit();
+  if (counted) leaderInfo.used = n;
   return attId;
 }
 
@@ -731,9 +751,12 @@ async function scanTab() {
   }
   if (!lectures.find(l => l.id === scanLectureId)) scanLectureId = lectures[0].id;
   scanLog = [];
+  const quotaHtml = (isLeader && !isMainLeader && !isDoctor && leaderInfo)
+    ? `<p class="muted">${leaderInfo.maxScans ? `المتبقي لك: <b>${num(leaderInfo.maxScans - (leaderInfo.used || 0))}</b> تسجيل` : "عدد التسجيلات: غير محدود"}${toDate(leaderInfo.expiresAt) ? ` — تنتهي صلاحياتك: ${fmt(leaderInfo.expiresAt)}` : ""}</p>` : "";
   setMain(`
     <section class="card">
       <h1>تسجيل الحضور بمسح الكارنيه</h1>
+      ${quotaHtml}
       <label>المحاضرة<select id="scanLec">${lectures.map(l =>
         `<option value="${esc(l.id)}" ${l.id === scanLectureId ? "selected" : ""}>${esc(l.courseName || "محاضرة")} — ${esc(l.title)}</option>`).join("")}</select></label>
       <div id="reader"></div>
@@ -808,6 +831,11 @@ async function handleCode(code, method, lec) {
   scanLog.unshift(res);
   scanLog = scanLog.slice(0, 8);
   $("#scanLog").innerHTML = scanLog.map(r => `<li><div><b>${esc(r.name || r.code)}</b><small>${esc(r.msg)}</small></div><span class="badge ${r.ok ? "ok" : ""}">${r.ok ? "✓" : "✗"}</span></li>`).join("");
+  if (isLeader && !isMainLeader && !isDoctor && !leaderActive(leaderInfo)) {
+    toast("انتهت صلاحياتك كليدر، وعدت طالبًا عاديًا");
+    await stopScanner();
+    setTimeout(() => enter(user).catch(() => {}), 2000);
+  }
 }
 
 async function registerByCode(code, method, lec) {
@@ -825,6 +853,10 @@ async function registerByCode(code, method, lec) {
     if (e.code === "permission-denied") {
       let already = false;
       try { already = (await getDoc(doc(db, "attendance", `${lec.id}_${acct.uid}`))).exists(); } catch { /* ignore */ }
+      if (!already && isLeader && !isMainLeader && !isDoctor) {
+        try { const li = await getDoc(doc(db, "leaders", user.uid)); leaderInfo = li.exists() ? li.data() : null; } catch { /* ignore */ }
+        if (!leaderActive(leaderInfo)) { const e2 = new Error("انتهت صلاحياتك كليدر (العدد أو المدة) وعدت طالبًا عاديًا"); e2.info = info; throw e2; }
+      }
       const err = new Error(already ? "تم تسجيل حضوره من قبل" : "تعذر التسجيل: تأكد أن المحاضرة ما زالت جارية");
       err.info = info;
       throw err;
@@ -842,7 +874,9 @@ async function studentsTab() {
     getDocs(query(collection(db, "users"), where("role", "==", "student"))),
     getDocs(collection(db, "leaders"))
   ]);
-  const leaderIds = new Set(lds.docs.map(d => d.id));
+  const leaderMap = {};
+  lds.docs.forEach(d => { leaderMap[d.id] = d.data(); });
+  const isLeadActive = uid => !!leaderMap[uid] && leaderActive(leaderMap[uid]);
   const users = us.docs.map(d => d.data());
   const priv = {}; // الأرقام الكاملة: الليدر الرئيسي فقط
   if (isMainLeader) { try { (await getDocs(collection(db, "userPrivate"))).forEach(d => { priv[d.id] = d.data().phone; }); } catch { /* ignore */ } }
@@ -850,7 +884,7 @@ async function studentsTab() {
   const phoneHtml = u => `<span dir="ltr">${esc(phoneOf(u))}</span>`;
 
   const rows = users.map(u => ({ key: u.uid, code: u.code || "", name: u.name, gender: u.gender || "", user: u }));
-  const statusOf = r => (leaderIds.has(r.user.uid) ? "approved" : (r.user.status || "pending"));
+  const statusOf = r => (isLeadActive(r.user.uid) ? "approved" : (r.user.status || "pending"));
   const stLabel = { incomplete: "لم يُكمل بياناته", pending: "قيد المراجعة", approved: "معتمد", removed: "مرفوض/موقوف" };
 
   setMain(`
@@ -870,6 +904,37 @@ async function studentsTab() {
   const findUser = uid => users.find(x => x.uid === uid);
   let pendShown = 20;
 
+  // ترقية لليدر بعدد تسجيلات ومدة محددين، وبعدها يعود طالبًا عاديًا تلقائيًا
+  const openPromote = st => {
+    const female = st.gender === "female";
+    const girlsTaken = Object.values(leaderMap).some(l => l.kind === "girls");
+    openModal(`<div class="sheet" id="sheet">
+      <h2>ترقية ${esc(st.name)} إلى ليدر</h2>
+      <label>عدد الطلاب المسموح بتسجيلهم<input id="pMax" type="number" min="1" max="100000" inputmode="numeric" placeholder="اتركه فارغًا لعدم التحديد"></label>
+      <label>المدة بالأيام<input id="pDays" type="number" min="0.1" step="0.1" inputmode="decimal" placeholder="اتركها فارغة لعدم التحديد"></label>
+      <p class="muted">عند وصوله للعدد أو انتهاء المدة يعود طالبًا عاديًا تلقائيًا.</p>
+      ${female ? `<label class="chk"><input type="checkbox" id="pGirls" ${girlsTaken ? "disabled" : ""}> ليدر البنات (واحدة فقط) — كارنيه وردي مميز${girlsTaken ? " — يوجد ليدر بنات بالفعل" : ""}</label>` : ""}
+      <button class="primary full" id="pOk">ترقية</button>
+      <button class="ghost full" id="pNo">إلغاء</button></div>`);
+    $("#sheet").onclick = e => e.stopPropagation();
+    $("#pNo").onclick = closeModal;
+    $("#pOk").onclick = async () => {
+      const maxScans = Math.max(0, parseInt($("#pMax").value, 10) || 0);
+      const days = parseFloat($("#pDays").value) || 0;
+      const kind = $("#pGirls")?.checked ? "girls" : "normal";
+      const expiresAt = days > 0 ? Timestamp.fromDate(new Date(Date.now() + days * 86400000)) : null;
+      $("#pOk").disabled = true;
+      try {
+        const bt = writeBatch(db);
+        bt.set(doc(db, "leaders", st.uid), { uid: st.uid, name: st.name, promotedBy: user.uid, createdAt: serverTimestamp(), kind, maxScans, used: 0, expiresAt });
+        if (kind === "girls") bt.set(doc(db, "settings", "girlsLeader"), { uid: st.uid, createdAt: serverTimestamp() });
+        await bt.commit();
+        leaderMap[st.uid] = { uid: st.uid, name: st.name, kind, maxScans, used: 0, expiresAt };
+        closeModal(); toast(`تمت ترقية ${st.name} إلى ليدر`); draw();
+      } catch (e) { toast(errText(e)); $("#pOk").disabled = false; }
+    };
+  };
+
   const setStatus = async (uid, status, msg) => {
     try { await updateDoc(doc(db, "users", uid), { status }); findUser(uid).status = status; toast(msg); draw(); }
     catch (e) { toast(errText(e)); }
@@ -878,7 +943,7 @@ async function studentsTab() {
   const draw = () => {
     const pending = rows.filter(r => r.user && statusOf(r) === "pending");
     const removed = rows.filter(r => statusOf(r) === "removed");
-    const canPromote = isMainLeader || (isDoctor && !mainLeaderId && leaderIds.size === 0);
+    const canPromote = isMainLeader;
 
     // طلبات الانضمام
     const shown = pending.slice(0, pendShown);
@@ -917,14 +982,18 @@ async function studentsTab() {
     const k = $("#search").value.trim().toLowerCase();
     const list = rows.filter(r => statusOf(r) !== "removed" && `${r.name} ${r.code} ${phoneOf(r.user)}`.toLowerCase().includes(k));
     const rowHtml = r => {
-      const st = statusOf(r), lead = r.user && leaderIds.has(r.user.uid), btns = [];
-      if (r.user && lead) { if (isMainLeader && r.user.uid !== mainLeaderId) btns.push(`<button class="ghost small" data-demote="${esc(r.user.uid)}">إلغاء ليدر</button>`); }
-      else if (r.user && st === "approved") {
+      const st = statusOf(r), li = r.user ? leaderMap[r.user.uid] : null, active = li && leaderActive(li), btns = [];
+      if (r.user && li) {
+        if (isMainLeader && r.user.uid !== mainLeaderId) btns.push(`<button class="ghost small" data-demote="${esc(r.user.uid)}">إلغاء ليدر</button>`);
+      } else if (r.user && st === "approved") {
         if (canPromote) btns.push(`<button class="secondary small" data-promote="${esc(r.user.uid)}">ترقية لليدر</button>`);
         if (isMainLeader) btns.push(`<button class="ghost small" data-remove="${esc(r.user.uid)}">إزالة</button>`);
       }
       if (isMainLeader && r.user) btns.push(`<button class="ghost small" data-pw="${esc(r.user.uid)}">كلمة المرور</button>`);
-      return `<tr><td>${esc(r.name)}${lead ? ` <span class="badge ok">${r.user.uid === mainLeaderId ? "ليدر رئيسي" : "ليدر"}</span>` : ""}${r.user ? `<small class="block">${phoneHtml(r.user)}</small>` : ""}</td>
+      const badge = li ? ` <span class="badge ${active ? "ok" : ""}">${r.user.uid === mainLeaderId ? "ليدر رئيسي" : !active ? "ليدر منتهي" : li.kind === "girls" ? "ليدر البنات" : "ليدر"}</span>` : "";
+      const usage = (li && r.user.uid !== mainLeaderId)
+        ? `<small class="block">${li.maxScans ? `استخدم ${num(li.used || 0)} من ${num(li.maxScans)}` : "بدون حد للعدد"}${toDate(li.expiresAt) ? ` — ${active ? "ينتهي" : "انتهى"} ${fmt(li.expiresAt)}` : ""}</small>` : "";
+      return `<tr><td>${esc(r.name)}${badge}${r.user ? `<small class="block">${phoneHtml(r.user)}</small>` : ""}${usage}</td>
         <td dir="ltr">${esc(r.code || "—")}</td><td>${stLabel[st]}</td><td><div class="acts">${btns.join("")}</div></td></tr>`;
     };
     $("#rows").innerHTML = groupByGender(list).map(gr => `<tr class="grp"><td colspan="4">${gr.title} (${num(gr.items.length)})</td></tr>${gr.items.map(rowHtml).join("")}`).join("")
@@ -953,21 +1022,18 @@ async function studentsTab() {
     $$("[data-restore]").forEach(b => b.onclick = () => setStatus(b.dataset.restore, "approved", "تمت إعادة التفعيل"));
     $$("[data-reject]").forEach(b => b.onclick = () => { if (confirm(`رفض حساب ${findUser(b.dataset.reject).name}؟`)) setStatus(b.dataset.reject, "removed", "تم رفض الحساب"); });
     $$("[data-remove]").forEach(b => b.onclick = () => { if (confirm(`إزالة ${findUser(b.dataset.remove).name}؟`)) setStatus(b.dataset.remove, "removed", "تمت إزالة الطالب"); });
-    $$("[data-promote]").forEach(b => b.onclick = async () => {
-      const st = findUser(b.dataset.promote);
-      if (!confirm(`ترقية ${st.name} إلى ليدر؟\nسيشاهد المحاضرات والكشوف ويمسح الكارنيهات لتسجيل الحضور.`)) return;
-      b.disabled = true;
-      try {
-        await setDoc(doc(db, "leaders", st.uid), { uid: st.uid, name: st.name, promotedBy: user.uid, createdAt: serverTimestamp() });
-        leaderIds.add(st.uid); toast(`تمت ترقية ${st.name} إلى ليدر`); draw();
-      } catch (e) { toast(errText(e)); b.disabled = false; }
-    });
+    $$("[data-promote]").forEach(b => b.onclick = () => openPromote(findUser(b.dataset.promote)));
     $$("[data-demote]").forEach(b => b.onclick = async () => {
-      const st = findUser(b.dataset.demote);
+      const st = findUser(b.dataset.demote), li = leaderMap[st.uid];
       if (!confirm(`إلغاء صلاحيات الليدر عن ${st.name}؟`)) return;
       b.disabled = true;
-      try { await deleteDoc(doc(db, "leaders", st.uid)); leaderIds.delete(st.uid); toast("تم إلغاء الليدر"); draw(); }
-      catch (e) { toast(errText(e)); b.disabled = false; }
+      try {
+        const bt = writeBatch(db);
+        bt.delete(doc(db, "leaders", st.uid));
+        if (li?.kind === "girls") bt.delete(doc(db, "settings", "girlsLeader"));
+        await bt.commit();
+        delete leaderMap[st.uid]; toast("تم إلغاء الليدر"); draw();
+      } catch (e) { toast(errText(e)); b.disabled = false; }
     });
     $$("[data-eapprove]").forEach(b => b.onclick = async () => {
       const uid = b.dataset.eapprove, r = reqs.find(x => x.uid === uid), cur = findUser(uid);
@@ -1262,48 +1328,69 @@ function loadImage(src) {
   return new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error("img")); i.src = src; });
 }
 
-async function buildCard({ name, code, photo }) {
+async function buildCard({ name, code, photo, variant = "blue" }) {
+  const T = {
+    blue: { head: ["#173f7a", "#173f7a", "#173f7a"], headInk: "#fff", border: "#173f7a", bg: "#ffffff", ink: "#12233f", accent: "#173f7a", sub: "#627088", photoBg: "#e9eff8", line2: `بطاقة حضور الطالب — ${CLASS_NAME}` },
+    gold: { head: ["#8a6100", "#f9e27d", "#b8860b"], headInk: "#2b1d00", border: "#c9a227", bg: "#fff8e1", ink: "#3b2a00", accent: "#8a6100", sub: "#7a6a3a", photoBg: "#fdf0c4", line2: `👑 الليدر الرئيسي — ${CLASS_NAME}` },
+    pink: { head: ["#ff5fa2", "#ffc2dc", "#ff5fa2"], headInk: "#6b1f45", border: "#ff5fa2", bg: "#fff0f6", ink: "#6b1f45", accent: "#e0307f", sub: "#a35a7d", photoBg: "#ffe0ee", line2: `💖 ليدر البنات — ${CLASS_NAME}` }
+  }[variant] || null;
+  const th = T || { head: ["#173f7a", "#173f7a", "#173f7a"], headInk: "#fff", border: "#173f7a", bg: "#fff", ink: "#12233f", accent: "#173f7a", sub: "#627088", photoBg: "#e9eff8", line2: `بطاقة حضور الطالب — ${CLASS_NAME}` };
   const W = 1012, H = 638;
   const c = document.createElement("canvas");
   c.width = W; c.height = H;
   const x = c.getContext("2d");
   try { await Promise.all([document.fonts.load('700 40px "IBM Plex Sans Arabic"'), document.fonts.load('400 28px "IBM Plex Sans Arabic"')]); } catch { /* ignore */ }
   const F = (w, s) => `${w} ${s}px "IBM Plex Sans Arabic", Tahoma, Arial, sans-serif`;
+  const rr = (px, py, pw, ph, r) => { x.beginPath(); if (x.roundRect) x.roundRect(px, py, pw, ph, r); else x.rect(px, py, pw, ph); };
   x.direction = "rtl";
-  x.fillStyle = "#fff"; x.fillRect(0, 0, W, H);
-  x.fillStyle = "#173f7a"; x.fillRect(0, 0, W, 130);
-  x.fillStyle = "#fff"; x.textAlign = "center";
+  x.fillStyle = th.bg; x.fillRect(0, 0, W, H);
+
+  // زخرفة الخلفية: قلوب للوردي ولمعة للذهبي
+  if (variant === "pink" || variant === "gold") {
+    x.save(); x.globalAlpha = 0.16; x.fillStyle = th.accent; x.textAlign = "center"; x.font = F(700, 54);
+    const mark = variant === "pink" ? "♥" : "✦";
+    [[110, 250], [330, 200], [560, 590], [860, 600], [120, 560], [640, 170], [900, 160]].forEach(([mx, my]) => x.fillText(mark, mx, my));
+    x.restore();
+  }
+  // الشريط العلوي
+  const g = x.createLinearGradient(0, 0, W, 0);
+  g.addColorStop(0, th.head[0]); g.addColorStop(0.5, th.head[1]); g.addColorStop(1, th.head[2]);
+  x.fillStyle = g; x.fillRect(0, 0, W, 130);
+  x.fillStyle = th.headInk; x.textAlign = "center";
   x.font = F(700, 44); x.fillText(COLLEGE, W / 2, 62);
-  x.font = F(400, 28); x.fillText(`بطاقة حضور الطالب — ${CLASS_NAME}`, W / 2, 106);
-  x.strokeStyle = "#173f7a"; x.lineWidth = 8; x.strokeRect(4, 4, W - 8, H - 8);
+  x.font = F(400, 28); x.fillText(th.line2, W / 2, 106);
+  // الإطار
+  x.strokeStyle = th.border; x.lineWidth = variant === "blue" ? 8 : 12; rr(6, 6, W - 12, H - 12, variant === "pink" ? 36 : variant === "gold" ? 10 : 2); x.stroke();
+  if (variant === "gold") { x.lineWidth = 3; x.strokeStyle = "#fff3b0"; rr(20, 20, W - 40, H - 40, 6); x.stroke(); }
+  if (variant === "pink") { x.lineWidth = 3; x.strokeStyle = "#ffffff"; rr(22, 22, W - 44, H - 44, 28); x.stroke(); }
 
   // الصورة (يمين)
   const pw = 240, ph = 320, px = W - 60 - pw, py = 165;
   x.save();
-  x.beginPath();
-  if (x.roundRect) x.roundRect(px, py, pw, ph, 18); else x.rect(px, py, pw, ph);
-  x.clip();
-  x.fillStyle = "#e9eff8"; x.fillRect(px, py, pw, ph);
+  rr(px, py, pw, ph, variant === "pink" ? 40 : 18); x.clip();
+  x.fillStyle = th.photoBg; x.fillRect(px, py, pw, ph);
   if (photo) { try { x.drawImage(await loadImage(photo), px, py, pw, ph); } catch { /* ignore */ } }
   x.restore();
-  x.strokeStyle = "#173f7a"; x.lineWidth = 4;
-  x.beginPath(); if (x.roundRect) x.roundRect(px, py, pw, ph, 18); else x.rect(px, py, pw, ph); x.stroke();
+  x.strokeStyle = th.border; x.lineWidth = 6;
+  rr(px, py, pw, ph, variant === "pink" ? 40 : 18); x.stroke();
 
   // الاسم والكود (يسار الصورة)
   const right = px - 30, maxW = right - 60;
-  x.fillStyle = "#12233f"; x.textAlign = "right"; x.font = F(700, 40);
+  x.fillStyle = th.ink; x.textAlign = "right"; x.font = F(700, 40);
   const lines = []; let cur = "";
   String(name).split(" ").forEach(w => { const t = cur ? `${cur} ${w}` : w; if (x.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; });
   if (cur) lines.push(cur);
   lines.slice(0, 3).forEach((l, i) => x.fillText(l, right, 215 + i * 52));
-  x.font = F(700, 34); x.fillStyle = "#173f7a";
+  x.font = F(700, 34); x.fillStyle = th.accent;
   x.fillText(`الكود الجامعي: ${code}`, right, 420);
-  x.font = F(400, 26); x.fillStyle = "#627088";
+  x.font = F(400, 26); x.fillStyle = th.sub;
   x.fillText("اعرض الـ QR لتسجيل حضورك", right, 470);
 
-  // QR (يسار أسفل)
+  // QR (يسار أسفل) داخل إطار بلون البطاقة
   try {
     const qr = await loadImage(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(qrSvg(cardPayload(code)))}`);
+    x.fillStyle = "#fff"; rr(48, 338, 274, 274, 16); x.fill();
+    x.strokeStyle = th.border; x.lineWidth = 6; rr(48, 338, 274, 274, 16); x.stroke();
     x.imageSmoothingEnabled = false;
     x.drawImage(qr, 60, 350, 250, 250);
   } catch { /* ignore */ }
@@ -1314,10 +1401,13 @@ async function cardTab() {
   if (!profile.code) { setMain(`<div class="card muted">لا يوجد كارنيه لأن حسابك بدون كود جامعي. ${isMainLeader ? "أضف كودك الجامعي وصورتك من تبويب حسابي." : ""}</div>`); return; }
   let photo = "";
   try { const p = await getDoc(doc(db, "photos", user.uid)); if (p.exists()) photo = p.data().data; } catch { /* ignore */ }
-  const canvas = await buildCard({ name: profile.name, code: profile.code, photo });
+  const variant = isMainLeader ? "gold" : isGirlsLeader ? "pink" : "blue";
+  const canvas = await buildCard({ name: profile.name, code: profile.code, photo, variant });
+  const expiredNote = (leaderInfo && !isLeader && !isDoctor) ? `<div class="result bad">انتهت صلاحياتك كليدر وعدت طالبًا عاديًا.</div>` : "";
   setMain(`
     <section class="card center">
       <h1>بطاقتي</h1>
+      ${expiredNote}
       <img id="cardImg" class="card-img" alt="الكارنيه">
       <p class="muted">اعرض الـ QR على الدكتور أو الليدر ليتم تسجيل حضورك فورًا.</p>
       <button class="primary full" id="dlCard">تحميل الكارنيه</button>
