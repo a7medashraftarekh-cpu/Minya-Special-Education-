@@ -10,7 +10,7 @@ import {
 import { firebaseConfig } from "./firebase-config.js";
 
 /* ---------- إعدادات ---------- */
-const APP_VERSION = "2026.10.23-4";
+const APP_VERSION = "2026.10.24-1";
 const LECTURE_MINUTES = 180; // المحاضرة تُغلق تلقائيًا بعد هذه المدة
 const COLLEGE = "كلية التربية النوعية";
 const CLASS_NAME = "الفرقة الأولى – إعلام";
@@ -712,7 +712,7 @@ async function manualAdd(lec, getRows) {
 // كتابة سجل الحضور + وقته (الوقت في مجموعة منفصلة يقرؤها الليدر الرئيسي والطالب صاحبها فقط)
 async function writeAttendance(lec, st, method) {
   const attId = `${lec.id}_${st.uid}`;
-  const counted = isLeader && !isMainLeader && !isDoctor && method !== "manual"; // الليدر المحدود: كل تسجيل يُحسب من عدده
+  const counted = isLeader && !isDoctor && method !== "manual"; // كل تسجيل بواسطة ليدر يُحسب في عدّاده
   const n = counted ? ((leaderInfo && leaderInfo.used) || 0) + 1 : 0;
   const bt = writeBatch(db);
   bt.set(doc(db, "attendance", attId), {
@@ -722,7 +722,7 @@ async function writeAttendance(lec, st, method) {
   });
   bt.set(doc(db, "attendanceTimes", attId), { lectureId: lec.id, studentId: st.uid, createdAt: serverTimestamp() });
   if (counted) {
-    bt.set(doc(db, "leaderScans", `${user.uid}_${n}`), { uid: user.uid, n, attId, createdAt: serverTimestamp() });
+    bt.set(doc(db, "leaderScans", `${user.uid}_${(leaderInfo && leaderInfo.gen) || ""}_${n}`), { uid: user.uid, n, attId, createdAt: serverTimestamp() });
     bt.update(doc(db, "leaders", user.uid), { used: n });
   }
   await bt.commit();
@@ -859,6 +859,7 @@ async function registerByCode(code, method, lec) {
       }
       const err = new Error(already ? "تم تسجيل حضوره من قبل" : "تعذر التسجيل: تأكد أن المحاضرة ما زالت جارية");
       err.info = info;
+      if (!already) err.detail = "permission-denied";
       throw err;
     }
     throw e;
@@ -923,13 +924,14 @@ async function studentsTab() {
       const days = parseFloat($("#pDays").value) || 0;
       const kind = $("#pGirls")?.checked ? "girls" : "normal";
       const expiresAt = days > 0 ? Timestamp.fromDate(new Date(Date.now() + days * 86400000)) : null;
+      const gen = crypto.randomUUID().replace(/-/g, "").slice(0, 12); // يميّز كل ترقية عن غيرها
       $("#pOk").disabled = true;
       try {
         const bt = writeBatch(db);
-        bt.set(doc(db, "leaders", st.uid), { uid: st.uid, name: st.name, promotedBy: user.uid, createdAt: serverTimestamp(), kind, maxScans, used: 0, expiresAt });
+        bt.set(doc(db, "leaders", st.uid), { uid: st.uid, name: st.name, promotedBy: user.uid, createdAt: serverTimestamp(), kind, gen, maxScans, used: 0, expiresAt });
         if (kind === "girls") bt.set(doc(db, "settings", "girlsLeader"), { uid: st.uid, createdAt: serverTimestamp() });
         await bt.commit();
-        leaderMap[st.uid] = { uid: st.uid, name: st.name, kind, maxScans, used: 0, expiresAt };
+        leaderMap[st.uid] = { uid: st.uid, name: st.name, kind, gen, maxScans, used: 0, expiresAt };
         closeModal(); toast(`تمت ترقية ${st.name} إلى ليدر`); draw();
       } catch (e) { toast(errText(e)); $("#pOk").disabled = false; }
     };
